@@ -1,0 +1,126 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+// TODO use constant buffers here?
+#include "MarchingCubeLookupTables.compute"
+
+struct Vertex
+{
+    float4 position;
+    float3 normal; 
+};
+
+// TODO used?
+SamplerState _linearClamp;
+Texture3D<float3> _normals;
+RWStructuredBuffer<Vertex> _vertexBuffer;
+static const int numOfThreads = 8;
+
+StructuredBuffer<float> _voxelDensities;
+float _densityThreshold;
+float3 _dimensions; 
+
+int GetPointIndexFromCoord(int x, int y, int z)
+{
+    return x + ( y * _dimensions.x ) + ( z * _dimensions.x * _dimensions.y);
+}
+
+void ConstructCubeFromNeighbourPoints(int x, int y, int z, out float cube[8])
+{
+    cube[0] = _voxelDensities[GetPointIndexFromCoord(x + 0, y + 0, z + 0)];
+    cube[1] = _voxelDensities[GetPointIndexFromCoord(x + 1, y + 0, z + 0)];
+    cube[2] = _voxelDensities[GetPointIndexFromCoord(x + 1, y + 1, z + 0)];
+    cube[3] = _voxelDensities[GetPointIndexFromCoord(x + 0, y + 1, z + 0)];
+    cube[4] = _voxelDensities[GetPointIndexFromCoord(x + 0, y + 0, z + 1)];
+    cube[5] = _voxelDensities[GetPointIndexFromCoord(x + 1, y + 0, z + 1)];
+    cube[6] = _voxelDensities[GetPointIndexFromCoord(x + 1, y + 1, z + 1)];
+    cube[7] = _voxelDensities[GetPointIndexFromCoord(x + 0, y + 1, z + 1)];
+}
+
+float GetOffset(float densityPoint1, float densityPoint2)
+{
+    float diff = densityPoint2 - densityPoint1;
+    return (diff == 0.0f) ? 0.5f : (_densityThreshold - densityPoint1) / diff;
+}
+
+Vertex CreateVertex(float3 position, float3 center, float3 size)
+{
+    Vertex vertex;
+    vertex.position = float4(position - center, 1.0);
+    
+    float3 uv = position / size;
+    vertex.normal = _normals.SampleLevel(_linearClamp, uv, 0);
+
+    return vertex;
+}
+
+[numthreads(numOfThreads, numOfThreads, numOfThreads)]
+void CSMain(int3 id : SV_DispatchThreadID)
+{
+    // stop one point before the end as we need neighbours for cube construction
+    if (id.x >= _dimensions.x - 1 || id.y >= _dimensions.y - 1 || id.z >= _dimensions.z - 1)
+    {
+        return;
+    }
+
+    float cube[8];
+    ConstructCubeFromNeighbourPoints(id.x, id.y, id.z, cube);
+
+    // calculate which case it is from the 256
+    int iCase = 0;
+    for (int i = 0; i < 8; i++)
+    {
+        if (cube[i] <= _densityThreshold)
+        {
+            iCase |= 1 << i;
+        }
+    }
+
+    // look up the edges for this case
+    int numOfPolys = CASE_TO_NUM_OF_POLYS[iCase];
+    if (numOfPolys == 0)
+    {
+        return;
+    }
+
+    // calculate the exact intersection point for every involved edge
+    float3 interpolatedVertices[12];
+    
+    for (int i = 0; i < 12; i++)
+    {
+        //if this edge is involved...
+        if ((numOfPolys & (1 << i)) != 0)
+        {
+            // calculate local offset on edge...
+            float offset = GetOffset(cube[ EDGES[i].x ], cube[ EDGES[i].y ]);
+
+            // ... and add to global offset (world coordinates) 
+            interpolatedVertices[i] = float3(id) + ( POINT_TO_3D_VERTEX_OFFSET[ EDGES[i].x ] + offset * EDGE_DIRECTION[i] );
+        }
+    }
+
+    // create the triangles
+    // there can be up to 5, to find out iterate the edge connections for this case
+    // TODO?
+    float3 center = float3(_dimensions.x, 0, _dimensions.z) / 2.0;
+    float3 size = float3(_dimensions.x - 1, _dimensions.y - 1, _dimensions.z - 1);
+    
+    for (int i = 0; i < 5; i++)
+    {
+        if (EDGE_CONNECTION_LIST[iCase][i * 3] >= 0)
+        {        
+            float3 vertexPos;
+            int index = GetPointIndexFromCoord(id.x, id.y, id.z);
+            vertexPos  = interpolatedVertices[ EDGE_CONNECTION_LIST[iCase][i * 3 + 0] ];
+            _vertexBuffer[index * 15 + (3 * i + 0)] = CreateVertex(vertexPos, center, size);
+
+            vertexPos = interpolatedVertices[ EDGE_CONNECTION_LIST[iCase][i * 3 + 1] ];
+            _vertexBuffer[index * 15 + (3 * i + 1)] = CreateVertex(vertexPos, center, size);
+
+            vertexPos = interpolatedVertices[ EDGE_CONNECTION_LIST[iCase][i * 3 + 2] ];
+            _vertexBuffer[index * 15 + (3 * i + 2)] = CreateVertex(vertexPos, center, size);
+        }
+    }
+}
+
+
